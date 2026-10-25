@@ -83,10 +83,13 @@ module vproc_vregunpack
 
     vproc_pkg::cfg_vsew                    pipe_in_eew_q;
     vproc_pkg::op_unit                     pipe_in_unit_q;
-      always_ff @(posedge clk_i) begin
-    if (~sync_rst_ni) begin
-        pipe_in_eew_q <= '0;
-        pipe_in_unit_q <= '0;
+      always_ff @(posedge clk_i or negedge async_rst_ni) begin
+    if (~async_rst_ni) begin
+        pipe_in_eew_q <= VSEW_8;
+        pipe_in_unit_q <= UNIT_LSU;
+    end else if (~sync_rst_ni) begin
+        pipe_in_eew_q <= VSEW_8;
+        pipe_in_unit_q <= UNIT_LSU;
     end else begin
         pipe_in_eew_q <= pipe_in_eew_i;  //Need to buffer this value, temporary fix.  
         pipe_in_unit_q <= pipe_in_unit_i;
@@ -138,7 +141,7 @@ module vproc_vregunpack
         stage_0.ctrl     = pipe_in_ctrl_i;
         stage_0.unit     = pipe_in_unit_i;
         stage_0.alt_eew  = pipe_in_alt_eew_i;
-        stage_0.eew      = pipe_in_eew_q;
+        stage_0.eew      = pipe_in_eew_i;
         stage_0.op_load  = pipe_in_op_load_i;
         stage_0.op_vaddr = pipe_in_op_vaddr_i;
         stage_0.op_flags = pipe_in_op_flags_i;
@@ -150,7 +153,7 @@ module vproc_vregunpack
             stage_0.ctrl     = pipe_in_ctrl_i;
             stage_0.unit     = pipe_in_unit_i;
             stage_0.alt_eew  = pipe_in_alt_eew_i;
-            stage_0.eew      = pipe_in_eew_q;
+            stage_0.eew      = pipe_in_eew_i;
             stage_0.op_load  = pipe_in_op_load_i;
             stage_0.op_vaddr = pipe_in_op_vaddr_i;
             stage_0.op_flags = pipe_in_op_flags_i;
@@ -432,7 +435,7 @@ module vproc_vregunpack
             op_load_eew     [i] = stage_state[OP_STAGE[i]    ].unit == UNIT_LSU & OP_ALT_COUNTER[i] ? stage_state[OP_STAGE[i]    ].alt_eew : stage_state[OP_STAGE[i]    ].eew;
             op_buffer       [i] = stage_state[OP_STAGE[i] + 1].op_buffer[i];
             op_extract_flags[i] = stage_state[OP_STAGE[i] + 1].op_flags[i];
-            op_extract_eew  [i] = stage_state[OP_STAGE[i]    ].unit == UNIT_LSU & OP_ALT_COUNTER[i] ? stage_state[OP_STAGE[i]    ].alt_eew : stage_state[OP_STAGE[i]    ].eew;
+            op_extract_eew  [i] = stage_state[OP_STAGE[i] + 1].unit == UNIT_LSU & OP_ALT_COUNTER[i] ? stage_state[OP_STAGE[i] + 1].alt_eew : stage_state[OP_STAGE[i] + 1].eew;
             op_xval         [i] = stage_state[OP_STAGE[i] + 1].op_xval[i];
             op_load_field_counter [i] = stage_state[OP_STAGE[i]    ].field_counter;
             op_extract_field_counter [i] = stage_state[OP_STAGE[i] + 1].field_counter;

@@ -2595,7 +2595,8 @@ module vproc_decoder #(
                 unique case (vsew_i)
                     VSEW_8:  vsew_o = VSEW_16;
                     VSEW_16: vsew_o = VSEW_32;
-                    default: ;
+                    // ELEN=32: no 64-bit intermediate datapath exists.
+                    default: emul_invalid = 1'b1;
                 endcase
                 unique case (lmul_i)
                     LMUL_F8,

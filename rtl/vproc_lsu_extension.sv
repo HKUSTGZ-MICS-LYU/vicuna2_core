@@ -53,7 +53,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
     endfunction
 
     /////////////////////////////////scratch memory//////////////////////////////// 
-    typedef logic [$clog2(MEM_PORTS)-1 : 0] port_select_t;
+    typedef logic [((MEM_PORTS > 1) ? $clog2(MEM_PORTS) : 1)-1 : 0] port_select_t;
     typedef logic [$clog2(PORT_QUEUE_DEPTH) : 0] portq_elem_cnt_t;
     typedef logic [$clog2(VLSU_QUEUE_SZ + (MEM_PORTS*PORT_QUEUE_DEPTH)) : 0] outstanding_mem_req_cnt_t;
 
@@ -79,6 +79,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
         logic [MEM_PORTS-1:0] misalignment_request_out;
         logic [MEM_PORTS-1:0][VMEM_W-1 : 0] misalignment_data;
         logic store;
+        logic killed; // snapshot before pack completion can release the execution ID
         logic [XIF_ID_W-1:0] id;
     } scratch_state_t;
 
@@ -210,14 +211,27 @@ module vproc_lsu_extension import vproc_pkg::*; #(
 
     always_ff @(posedge clk_i or negedge async_rst_ni) begin
         if (~async_rst_ni) begin
+            scratch_state_q <= '0;
             scratch_state_q.fsm_state <= IDLE;
+            port_state_q <= '0;
+            mem_exc_q <= 1'b0;
+            mem_err_q <= 1'b0;
+            mem_any_err_q <= 1'b0;
+            mem_exccode_q <= '0;
         end
         else if (~sync_rst_ni) begin
+            scratch_state_q <= '0;
             scratch_state_q.fsm_state <= IDLE;
+            port_state_q <= '0;
+            mem_exc_q <= 1'b0;
+            mem_err_q <= 1'b0;
+            mem_any_err_q <= 1'b0;
+            mem_exccode_q <= '0;
         end
         else begin
             scratch_state_q <= scratch_state_d;
             port_state_q <= port_state_d;
+            mem_exc_q     <= mem_exc_d;
             mem_err_q     <= mem_err_d;
             mem_any_err_q <= mem_any_err_d;
             mem_exccode_q <= mem_exccode_d;
@@ -288,9 +302,9 @@ module vproc_lsu_extension import vproc_pkg::*; #(
             obi_bus_wdata[i] = mem_req_queue_data_out[i].wdata;
             obi_bus_aid[i]   = i; // TODO: USE_XIF_MEM needs id from state_red_req
 
-            if(obi_bus_gnt[i] & port_queue_ready_in[i]) begin
+            if(obi_bus_req[i] & obi_bus_gnt[i] & port_queue_ready_in[i]) begin
                 port_state_d.portq_elem_cnt[i] = port_state_q.portq_elem_cnt[i];
-            end else if (obi_bus_gnt[i]) begin
+            end else if (obi_bus_req[i] & obi_bus_gnt[i]) begin
                 port_state_d.portq_elem_cnt[i] = port_state_q.portq_elem_cnt[i] + 1;
             end else if (port_queue_ready_in[i]) begin
                 port_state_d.portq_elem_cnt[i] = port_state_q.portq_elem_cnt[i] - 1;
@@ -332,7 +346,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
     generate
         for (genvar i = 0; i < MEM_PORTS; i++) begin
             vproc_queue #(
-                .WIDTH        ( $bits(LSU_STATE_RED_T)                                                                  ),
+                .WIDTH        ( $bits(mem_req_queue_data_t)                                                            ),
                 .DEPTH        ( VLSU_QUEUE_SZ                                                                           ),
                 .FLOW         ( 1'b1                                                                                    )
             ) mem_req_queue (
@@ -348,7 +362,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
                 .flags_any_o  (                                                                                         ),
                 .flags_all_o  (                                                                                         )
             );
-            assign mem_req_queue_ready_in[i] = obi_bus_gnt[i] | (mem_exc_q & ~mem_req_queue_data_out[i].first_cycle);
+            assign mem_req_queue_ready_in[i] = (obi_bus_req[i] & obi_bus_gnt[i]) | (mem_exc_q & ~mem_req_queue_data_out[i].first_cycle);
         end
     endgenerate
 
@@ -357,7 +371,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
     generate
         for (genvar i = 0; i < MEM_PORTS; i++) begin
             vproc_queue #(
-                .WIDTH        ( $bits(LSU_STATE_RED_T)                                        ),
+                .WIDTH        ( VMEM_W + 1                                                   ),
                 .DEPTH        ( PORT_QUEUE_DEPTH                                              ),
                 .FLOW         ( 1'b1                                                          )
             ) port_queue (
@@ -453,6 +467,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
 
                 scratch_state_d.id = state_req_red.id;
                 scratch_state_d.store = state_req_red.mode.store;
+                scratch_state_d.killed = instr_state_i[state_req_red.id] == INSTR_KILLED;
                 
                 scratch_state_d.outstanding_mem_req_cnt = 0;
 
@@ -617,6 +632,10 @@ module vproc_lsu_extension import vproc_pkg::*; #(
                             scratch_state_d.fsm_state = LOAD_MISALIGNMENT;
                         end
 
+                    end
+                    if (~pending_req_stall & ~misalignment_request_any & state_req_red.last_cycle &
+                        (state_req_red.field_init_count == '0 | state_req_red_end_of_field)) begin
+                        scratch_state_d.fsm_state = state_req_red.mode.store ? LAST_CYCLE_STORE : LAST_CYCLE_LOAD;
                     end
                 end
             end    
@@ -911,14 +930,16 @@ module vproc_lsu_extension import vproc_pkg::*; #(
 
             LAST_CYCLE_LOAD: begin
                 pending_req_stall = 1;
-                if(scratch_state_q.outstanding_mem_req_cnt == '0 & ~output_queue_valid_out) begin
+                if ((scratch_state_q.outstanding_mem_req_cnt == '0) & ~output_queue_valid_out &
+                    (trans_complete_ready | scratch_state_q.killed)) begin
                     scratch_state_d.fsm_state = IDLE;
                 end
             end
 
             LAST_CYCLE_STORE: begin
                 pending_req_stall = 1;
-                if(scratch_state_q.outstanding_mem_req_cnt == '0) begin
+                if ((scratch_state_q.outstanding_mem_req_cnt == '0) & ~output_queue_valid_out &
+                    (trans_complete_ready | scratch_state_q.killed)) begin
                     scratch_state_d.fsm_state = IDLE;
                 end
             end
@@ -1054,7 +1075,7 @@ module vproc_lsu_extension import vproc_pkg::*; #(
 
         // Output port configuration
         for(int i = 0; i < MEM_PORTS; i++) begin
-            if(port_queue_ready_in[i]) begin
+            if(port_queue_ready_in[i] & port_queue_valid_out[i]) begin
                 mem_any_err_d |= port_queue_mem_err_out[i];
                 scratch_state_d.outstanding_mem_req_cnt = scratch_state_d.outstanding_mem_req_cnt - 1; // read from d since it could have been incremented before
             end
@@ -1122,39 +1143,34 @@ module vproc_lsu_extension import vproc_pkg::*; #(
 
     // Ready signals
     assign output_queue_ready_in = output_queue_valid_out & 
-                                    ((~deq_state.mode.store & all_ports_finished | misalignment_request_finished) | deq_state.mode.store | mem_err_d);
+                                    ((~deq_state.mode.store & all_ports_finished | misalignment_request_finished) | deq_state.mode.store);
 
     assign input_queue_ready_in  = output_queue_ready_out;
 
     // Valid signals
     assign state_rdata_valid_d = output_queue_valid_out & output_queue_ready_in & ~misalignment_request_out_any;
 
-    // monitor the memory result for bus errors and the queue for exceptions
+    // Accumulate accepted responses, including the last/only response in
+    // this cycle. An error must not shortcut draining outstanding responses.
     always_comb begin
-        mem_err_d     = mem_err_q;
+        mem_err_d = mem_err_q | mem_any_err_d;
         mem_exccode_d = mem_exccode_q;
-        if (output_queue_valid_out & (deq_state.first_cycle | ~mem_err_q)) begin
-            // reset the error flag in the first cycle, unless there is a bus
-            // error or an exception occured during the request
-            mem_err_d     = mem_err_q | (mem_any_err_q); // TODO deq_state.exc
-            mem_exccode_d = mem_err_q ? mem_exccode_q : ( // TODO deq_state.exc
-                // bus error translates to a load/store access fault exception
-                deq_state.mode.store ? 6'h07 : 6'h05
-            );
+        if (scratch_state_q.fsm_state == IDLE) begin
+            mem_err_d = 1'b0;
+            mem_exccode_d = '0;
+        end else if (~mem_err_q & mem_any_err_d) begin
+            mem_exccode_d = scratch_state_q.store ? 6'h07 : 6'h05;
         end
     end
 
-    // LSU transaction complete queue, result indicates potential exceptions
+    // Completion is held until the queue accepts it. Stores, like loads,
+    // complete only after all issued requests have received responses.
     logic trans_complete_valid, trans_complete_ready;
-    assign trans_complete_valid = ((~scratch_state_q.store & state_rdata_valid_d & deq_state.last_cycle & 
-                                 (deq_state.field_init_count == '0 | deq_state_end_of_field)) &
-                                  (instr_state_i[scratch_state_q.id] == INSTR_COMMITTED)) |
-                                  (scratch_state_q.store & state_rdata_valid_d & deq_state.last_cycle & 
-                                 (deq_state.field_init_count == '0 | deq_state_end_of_field));
-
-    /*assign trans_complete_valid = ((~scratch_state_q.store & scratch_state_q.fsm_state == LAST_CYCLE_LOAD & scratch_state_d.fsm_state == IDLE) &
-                                  (instr_state_i[scratch_state_q.id] == INSTR_COMMITTED)) |
-                                  (scratch_state_q.store & scratch_state_q.fsm_state == LAST_CYCLE_STORE & scratch_state_d.fsm_state == IDLE);*/
+    assign trans_complete_valid =
+        ((scratch_state_q.fsm_state == LAST_CYCLE_LOAD) |
+         (scratch_state_q.fsm_state == LAST_CYCLE_STORE)) &
+        (scratch_state_q.outstanding_mem_req_cnt == '0) & ~output_queue_valid_out &
+        ~scratch_state_q.killed;
 
     vproc_queue #(
         .WIDTH        ( XIF_ID_W + 7                                                          ),

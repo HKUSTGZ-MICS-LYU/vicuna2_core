@@ -65,6 +65,7 @@ module vproc_pipeline import vproc_pkg::*, obi_pkg::*; #(
 
         input  instr_state [XIF_ID_CNT-1:0] instr_state_i,
         output logic                    instr_done_valid_o,
+        output logic                    vxsat_set_o,
         output logic [XIF_ID_W-1:0]     instr_done_id_o,
 
         // connections to register file
@@ -771,7 +772,10 @@ module vproc_pipeline import vproc_pkg::*, obi_pkg::*; #(
             ((RES_ALWAYS_VREG | state_q.res_vreg) != '0) // at least one valid vreg
             ) begin
             //if (~state_q.op_flags[0].elemwise  | count_next_inc > (state_q.vl  >> ($clog2(MAX_OP_W/8) - $clog2(MAX_OP_W/COUNTER_OP_W)))) begin //TODO: why doesnt this formula work above, only for elemwise)
-                            res_store = ((RES_NARROW & state_q.res_narrow) == '0) | ~count_next_inc.part.mul[0];
+                            // Early stopping may end within the first source vreg:
+                            // flush its final narrow destination and pending write.
+                            res_store = ((RES_NARROW & state_q.res_narrow) == '0) |
+                                        ~count_next_inc.part.mul[0] | state_q.last_cycle;
             //end - This fixes the extra res_store signals, but not sure theyre a problem.
 
         end
@@ -1454,6 +1458,7 @@ module vproc_pipeline import vproc_pkg::*, obi_pkg::*; #(
         .vreg_wr_clr_cnt_o           ( vreg_wr_clr_cnt_o       ),
         .pending_vreg_reads_i        ( vreg_pend_rd_i          ),
         .instr_state_i               ( instr_state_i           ),
+        .vxsat_set_o                 ( vxsat_set_o             ),
         .instr_done_valid_o          ( instr_done_valid_o      ),
         .instr_done_id_o             ( instr_done_id_o         )
     );

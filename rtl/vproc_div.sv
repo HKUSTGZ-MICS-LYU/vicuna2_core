@@ -82,7 +82,22 @@ module vproc_div #(
     ///////////////////////////////////////////////////////////////////////////
 
 
-    always_ff @(posedge clk_i) begin
+    always_ff @(posedge clk_i or negedge async_rst_ni) begin
+        if (~async_rst_ni) begin
+            opa_i_q <= '0;
+            opb_i_q <= '0;
+            unit_ctrl_q <= '0;
+            data_valid_i_q <= 1'b0;
+            operand_mask_q <= '0;
+            result_partial_q <= '0;
+        end else if (~sync_rst_ni) begin
+            opa_i_q <= '0;
+            opb_i_q <= '0;
+            unit_ctrl_q <= '0;
+            data_valid_i_q <= 1'b0;
+            operand_mask_q <= '0;
+            result_partial_q <= '0;
+        end else begin
         //only advance input buffers if ALL div units are ready
         if ( &div_ready_o ) begin
             opa_i_q <= opa_i_d;
@@ -100,9 +115,9 @@ module vproc_div #(
         end
 
         if (&div_valid_o) begin
-            result_partial_q <= result_partial_d_shifted; 
+            result_partial_q <= result_partial_d_shifted;
         end
-
+        end
     end
 
     ///////////////////////////////////////////////////////////////////////////
@@ -165,8 +180,10 @@ module vproc_div #(
         endcase
     end
 
-    always_ff @(posedge clk_i) begin
-        if (async_rst_ni == 1'b0 | (pipe_out_valid_o & unit_ctrl_q.last_cycle)) begin
+    always_ff @(posedge clk_i or negedge async_rst_ni) begin
+        if (~async_rst_ni) begin
+            shift_counter <= 2'b0;
+        end else if (~sync_rst_ni | (pipe_out_valid_o & unit_ctrl_q.last_cycle)) begin
             shift_counter <= 2'b0;
         end else begin
             shift_counter <= shift_counter_next;
@@ -257,7 +274,7 @@ module vproc_div #(
             cv32e40x_div div_i
             (
             .clk                ( clk_i                                ),
-            .rst_n              ( async_rst_ni                         ), //which reset signal should be used? TODO
+            .rst_n              ( async_rst_ni & sync_rst_ni          ),
 
             // Input IF
             .data_ind_timing_i  ( 1'b1                                 ), // When enabled, all divisions take same number of cycles.  Drastically improves performance on unit tests(unexpected)

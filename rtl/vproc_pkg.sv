@@ -453,7 +453,8 @@ typedef struct packed {
     logic       elemwise;
     logic       narrow;
     logic       narrow_frac;
-    logic       saturate;
+    logic       saturate; // narrowing clamp control, not an event
+    logic       saturated; // actual active-lane clamp event
     logic       sig;
     logic [2:0] mul_idx;
     logic [4:0] vreg_idx; //TODO: This should be defined per pipeline as log2(VREG_W/MAX_OP_W) bits wide

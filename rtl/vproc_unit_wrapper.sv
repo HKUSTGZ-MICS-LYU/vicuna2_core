@@ -156,6 +156,7 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
             logic [MAX_OP_W  -1:0] unit_out_res_alu;
             logic [MAX_OP_W/8-1:0] unit_out_res_cmp;
             logic [MAX_OP_W/8-1:0] unit_out_mask;
+            logic [MAX_OP_W/8-1:0] unit_out_saturated;
             vproc_alu #(
                 .ALU_OP_W           ( MAX_OP_W                                    ),
                 .CTRL_T             ( CTRL_T                                      ),
@@ -175,6 +176,7 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
                 .pipe_out_ctrl_o    ( unit_out_ctrl                               ),
                 .pipe_out_res_alu_o ( unit_out_res_alu                            ),
                 .pipe_out_res_cmp_o ( unit_out_res_cmp                            ),
+                .pipe_out_saturated_o ( unit_out_saturated ),
                 .pipe_out_mask_o    ( unit_out_mask                               )
             );
             always_comb begin
@@ -188,7 +190,9 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
                 pipe_out_res_mask_o  = '0;
 
                 pipe_out_res_store_o[0]                 = unit_out_ctrl.res_store & ~unit_out_ctrl.mode.alu.cmp;
+                pipe_out_res_flags_o[0].saturated = |(unit_out_saturated & unit_out_mask);
                 pipe_out_res_flags_o[0].shift           = unit_out_ctrl.res_shift;
+                pipe_out_res_flags_o[0].mul_idx         = unit_out_ctrl.count_mul;
                 pipe_out_res_flags_o[0].narrow          = unit_out_ctrl.res_narrow[0];
                 pipe_out_res_flags_o[0].narrow_frac     = unit_out_ctrl.res_narrow_frac;
                 pipe_out_res_flags_o[0].saturate        = unit_out_ctrl.mode.alu.sat_res;
@@ -214,6 +218,7 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
             CTRL_T                 unit_out_ctrl;
             logic [MAX_OP_W  -1:0] unit_out_res;
             logic [MAX_OP_W/8-1:0] unit_out_mask;
+            logic [MAX_OP_W/8-1:0] unit_out_saturated;
             vproc_mul #(
                 .MUL_OP_W         ( MAX_OP_W                                    ),
                 .MUL_TYPE         ( MUL_TYPE                                    ),
@@ -234,6 +239,7 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
                 .pipe_out_ready_i ( pipe_out_ready_i                            ),
                 .pipe_out_ctrl_o  ( unit_out_ctrl                               ),
                 .pipe_out_res_o   ( unit_out_res                                ),
+                .pipe_out_saturated_o ( unit_out_saturated ),
                 .pipe_out_mask_o  ( unit_out_mask                               )
             );
             always_comb begin
@@ -245,6 +251,7 @@ module vproc_unit_wrapper import vproc_pkg::*; #(
                 pipe_out_res_flags_o = '{default: pack_flags'('0)};
                 pipe_out_res_data_o  = '0;
                 pipe_out_res_mask_o  = '0;
+                pipe_out_res_flags_o[0].saturated = |(unit_out_saturated & unit_out_mask);
                 pipe_out_res_flags_o[0].shift           = 1'b1;
                 pipe_out_res_store_o[0]                 = unit_out_ctrl.res_store;
                 pipe_out_res_valid_o[0]                 = pipe_out_valid_o;

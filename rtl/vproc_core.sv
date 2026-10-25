@@ -52,6 +52,9 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
 
         output logic                     pending_load_o,
         output logic                     pending_store_o,
+        output logic                     busy_o,
+        output logic [(1<<XIF_ID_W)-1:0] active_ids_o,
+        output logic                     rf_pending_o,
 
         // CSR connections
         output logic [31:0]              csr_vtype_o,
@@ -258,7 +261,7 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
     assign csr_vtype_o  = cfg_valid ? {24'b0, agnostic_q, 1'b0, vsew_q, lmul_q} : 32'h80000000;
     assign csr_vl_o     = cfg_valid ? {{(32-CFG_VL_W-1){1'b0}}, vl_csr_q} : '0;
     assign csr_vlenb_o  = VREG_W / 8;
-    assign csr_vstart_o = '0;
+    assign csr_vstart_o = {{(32-CFG_VL_W){1'b0}}, vstart_q};
     assign csr_vxrm_o   = vxrm_q;
     assign csr_vxsat_o  = vxsat_q;
 
@@ -397,24 +400,42 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
     // ID of a new instruction is still valid.
     instr_state [XIF_ID_CNT-1:0] instr_state_q,     instr_state_d;     // instruction state
     logic       [XIF_ID_CNT-1:0] instr_empty_res_q, instr_empty_res_d; // empty result mask
+    logic [XIF_ID_CNT-1:0] instr_owned_q, instr_owned_d;
+    logic [XIF_ID_CNT-1:0] instr_commit_pending_q, instr_commit_pending_d;
+    logic result_commit_valid;
+    // Native host commits after acceptance. Legacy combined issue/commit is
+    // qualified by this cycle's acceptance, never by an unowned host ID.
+    assign result_commit_valid = xif_commit_if.commit_valid &
+        (instr_commit_pending_q[xif_commit_if.commit.id]
+`ifdef COMMIT_AND_ISSUE
+         | (instr_offload & (xif_issue_if.issue_req.id == xif_commit_if.commit.id))
+`endif
+        );
     always_ff @(posedge clk_i or negedge async_rst_n) begin : vproc_commit_buf
         if (~async_rst_n) begin
             instr_state_q    <= '{default: INSTR_INVALID};
+            instr_empty_res_q <= '0;
+            instr_owned_q <= '0;
+            instr_commit_pending_q <= '0;
         end
         else if (~sync_rst_n) begin
             instr_state_q    <= '{default: INSTR_INVALID};
+            instr_empty_res_q <= '0;
+            instr_owned_q <= '0;
+            instr_commit_pending_q <= '0;
         end else begin
             instr_state_q    <= instr_state_d;
+            instr_empty_res_q <= instr_empty_res_d;
+            instr_owned_q <= instr_owned_d;
+            instr_commit_pending_q <= instr_commit_pending_d;
         end
     end
-    always_ff @(posedge clk_i) begin
-        instr_empty_res_q <= instr_empty_res_d;
-    end
-
-    assign issue_id_used = instr_state_q[xif_issue_if.issue_req.id] != INSTR_INVALID;
+    assign issue_id_used = (instr_state_q[xif_issue_if.issue_req.id] != INSTR_INVALID) |
+                           instr_owned_q[xif_issue_if.issue_req.id];
 
     // Instruction complete signal for each pipeline
     logic [PIPE_CNT-1:0]               instr_complete_valid;
+    logic [PIPE_CNT-1:0]               pipe_vxsat_set;
     logic [PIPE_CNT-1:0][XIF_ID_W-1:0] instr_complete_id;
 
     // return an empty result or VL as result
@@ -442,6 +463,8 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
     always_comb begin
         instr_state_d      = instr_state_q;
         instr_empty_res_d  = instr_empty_res_q;
+        instr_owned_d = instr_owned_q;
+        instr_commit_pending_d = instr_commit_pending_q;
         result_csr_valid   = 1'b0;
         result_csr_id      = dec_data_q.id;
         result_csr_addr    = dec_data_q.rd.addr;
@@ -450,40 +473,30 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
         dec_clear          = 1'b0;
 
         if (instr_offload) begin
-            // For each issued instruction, remember whether it will produce an
-            // empty result or not. This must be done for accepted as well as
-            // rejected instructions, since the main core will commit all of
-            // them and rejected instructions must not produce a result.
-            `ifdef COMMIT_AND_ISSUE
-                //CVA6 sends commit and issue together
-                instr_state_d    [xif_issue_if.issue_req.id] = INSTR_COMMITTED;
-            `else
-                instr_state_d    [xif_issue_if.issue_req.id] = INSTR_SPECULATIVE;
-            `endif
+            // Only accepted instructions own an ID and may produce a result.
+            instr_state_d[xif_issue_if.issue_req.id] = INSTR_SPECULATIVE;
+            instr_owned_d[xif_issue_if.issue_req.id] = 1'b1;
+            instr_commit_pending_d[xif_issue_if.issue_req.id] = 1'b1;
             instr_empty_res_d[xif_issue_if.issue_req.id] = ~xif_issue_if.issue_resp.writeback & ~xif_issue_if.issue_resp.loadstore;
         end
 
         // Generate an empty result for all instructions except those that
         // writeback to the main core and for vector loads and stores
-        `ifdef COMMIT_AND_ISSUE
-        if (xif_commit_if.commit_valid) begin
-            result_empty_valid = instr_empty_res_q[xif_commit_if.commit.id] || instr_empty_res_d[xif_commit_if.commit.id]; //allow for commit in same cycle as issue
+        if (result_commit_valid) begin
+            result_empty_valid = !xif_commit_if.commit.commit_kill & instr_empty_res_d[xif_commit_if.commit.id];
+            instr_commit_pending_d[xif_commit_if.commit.id] = 1'b0;
+            if (xif_commit_if.commit.commit_kill) begin
+                instr_empty_res_d[xif_commit_if.commit.id] = 1'b0;
+                instr_owned_d[xif_commit_if.commit.id] = 1'b0;
+            end
         end
-        //clear instr_empty_res_d on successful result signalling
         if (xif_result_if.result_valid && xif_result_if.result_ready) begin
             instr_empty_res_d[xif_result_if.result.id] = 1'b0;
+            instr_owned_d[xif_result_if.result.id] = 1'b0;
         end
-        `else
-        if (xif_commit_if.commit_valid & (instr_state_q[xif_commit_if.commit.id] != INSTR_INVALID)) begin
-            result_empty_valid = instr_empty_res_q[xif_commit_if.commit.id];
-        end
-        `endif   
         // Only instructions that have already been offloaded or are being offloaded right now
         // can be committed.  Commit transactions for invalid IDs are ignored. //CV32A6 can commit an instruction while offloading
-        if (xif_commit_if.commit_valid & (
-            (instr_offload & (xif_issue_if.issue_req.id == xif_commit_if.commit.id)) |
-            (instr_state_q[xif_commit_if.commit.id] != INSTR_INVALID)
-        )) begin
+        if (result_commit_valid) begin
             if (dec_buf_valid_q & (dec_data_q.unit == UNIT_CFG) & (dec_data_q.id == xif_commit_if.commit.id)) begin
                 // Configuration instructions are not enqueued.  The instruction
                 // is retired and the result returned as soon as it is
@@ -496,7 +509,9 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
                     instr_state_d[xif_commit_if.commit.id] = xif_commit_if.commit.commit_kill ?
                                                              INSTR_KILLED : INSTR_COMMITTED;
                 end
-            end else begin
+            end else if ((instr_state_q[xif_commit_if.commit.id] != INSTR_INVALID) |
+                         (instr_offload & (xif_issue_if.issue_req.id == xif_commit_if.commit.id))) begin
+                // Do not resurrect an already completed result-only operation.
                 instr_state_d[xif_commit_if.commit.id] = xif_commit_if.commit.commit_kill ?
                                                          INSTR_KILLED : INSTR_COMMITTED;
             end
@@ -549,13 +564,13 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
         vl_csr_d   = vl_csr_q;
         vstart_d   = vstart_q;
         vxrm_next  = vxrm_q;
-        vxsat_d    = vxsat_q;
+        vxsat_d    = vxsat_q | (|pipe_vxsat_set);
 
         result_csr_delayed = DONT_CARE_ZERO ? '0 : 'x;
         result_csr_data    = DONT_CARE_ZERO ? '0 : 'x;
 
         // regular CSR register read/write
-        if (result_csr_valid) begin
+        if (result_csr_valid & result_csr_ready) begin
             result_csr_delayed = 1'b0; // result is the current (old) value for regular CSR reads
             unique case (dec_data_q.mode.cfg.csr_op)
                 CFG_VTYPE_READ:   result_csr_data = csr_vtype_o;
@@ -594,7 +609,8 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
         end
 
         // update configuration state for vset[i]vl[i] instructions
-        if (result_csr_valid & (dec_data_q.mode.cfg.csr_op == CFG_VSETVL)) begin
+        if (result_csr_valid & result_csr_ready & (dec_data_q.mode.cfg.csr_op == CFG_VSETVL)) begin
+            vstart_d           = '0;
             vsew_d             = dec_data_q.mode.cfg.vsew;
             lmul_d             = dec_data_q.mode.cfg.lmul;
             agnostic_d         = dec_data_q.mode.cfg.agnostic;
@@ -722,6 +738,11 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
                 vl_csr_d = '0;
             end
         end
+        // Host CsrService is the native CSR entry point. Sideband writes
+        // take priority over legacy XIF updates on a simultaneous write.
+        if (csr_vstart_set_i) vstart_d = csr_vstart_i[CFG_VL_W-1:0];
+        if (csr_vxrm_set_i) vxrm_next = csr_vxrm_i;
+        if (csr_vxsat_set_i) vxsat_d = csr_vxsat_i;
     end
 
 
@@ -789,6 +810,7 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
             assign queue_valid_d = queue_push;
             assign queue_ready   = ~queue_valid_q | op_ack;
             assign queue_data_d  = dec_data_q;
+            assign queue_flags_any = '0;
         end
     endgenerate
 
@@ -893,12 +915,16 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
 
     generate
         if (BUF_FLAGS[BUF_VREG_WR]) begin
-            always_ff @(posedge clk_i) begin
+            always_ff @(posedge clk_i or negedge async_rst_n) begin
+                if (~async_rst_n) vregfile_wr_en_q <= '0;
+                else if (~sync_rst_n) vregfile_wr_en_q <= '0;
+                else begin
                 for (int i = 0; i < VPORT_WR_CNT; i++) begin
                     vregfile_wr_en_q  [i] <= vregfile_wr_en_d  [i];
                     vregfile_wr_addr_q[i] <= vregfile_wr_addr_d[i];
                     vregfile_wr_data_q[i] <= vregfile_wr_data_d[i];
                     vregfile_wr_mask_q[i] <= vregfile_wr_mask_d[i];
+                end
                 end
             end
         end else begin
@@ -954,6 +980,43 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
     logic [PIPE_CNT-1:0][VREG_W/8-1:0] pipe_vreg_wr_be;
     logic [PIPE_CNT-1:0]               pipe_vreg_wr_clr;
     logic [PIPE_CNT-1:0][1:0]          pipe_vreg_wr_clr_cnt;
+
+    always_comb begin
+        for (int i = 0; i < XIF_ID_CNT; i++) begin
+            active_ids_o[i] = instr_owned_q[i] | (instr_state_q[i] != INSTR_INVALID);
+        end
+    end
+    // TIMEPRED retries can have gaps after the first accepted write. Cover
+    // the longest replay schedule conservatively without hierarchy probes.
+    function automatic int RF_REPLAY_CYCLES();
+        int count, max_count;
+        max_count = 1;
+        for (int i = 0; i < PIPE_CNT; i++) begin
+            count = 1;
+            for (int j = 0; j < i; j++) begin
+                if (PIPE_VPORT_WR[j] == PIPE_VPORT_WR[i]) count++;
+            end
+            if (count > max_count) max_count = count;
+        end
+        return 1 << (max_count - 1);
+    endfunction
+    localparam int RF_REPLAY_WINDOW = RF_REPLAY_CYCLES();
+    logic [RF_REPLAY_WINDOW-1:0] rf_replay_pending_q;
+    if (BUF_FLAGS[BUF_VREG_WR_MUX_TIMEPRED]) begin : gen_rf_replay_pending
+        always_ff @(posedge clk_i or negedge async_rst_n) begin
+            if (~async_rst_n) rf_replay_pending_q <= '0;
+            else if (~sync_rst_n) rf_replay_pending_q <= '0;
+            else rf_replay_pending_q <= (rf_replay_pending_q << 1) |
+                                        RF_REPLAY_WINDOW'(|pipe_vreg_wr_valid);
+        end
+    end else begin : gen_no_rf_replay_pending
+        assign rf_replay_pending_q = '0;
+    end
+    assign rf_pending_o = (|pend_vreg_wr_map) | (|pipe_vreg_wr_valid) |
+                          (|vregfile_wr_en_d) | (|vregfile_wr_en_q) |
+                          (|rf_replay_pending_q);
+    assign busy_o = (|active_ids_o) | dec_buf_valid_q | queue_valid_q |
+                    queue_valid_d | rf_pending_o | pending_load_o | pending_store_o;
 
     logic                lsu_trans_complete_valid;
     logic                lsu_trans_complete_ready;
@@ -1057,6 +1120,7 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
                 .vreg_pend_rd_o           ( pipe_vreg_pend_rd_out[i]   ),
                 .vreg_pend_rd_i           ( pipe_vreg_pend_rd_in [i]   ),
                 .instr_state_i            ( instr_state_q              ),
+                .vxsat_set_o              ( pipe_vxsat_set[i]          ),
                 .instr_done_valid_o       ( instr_complete_valid[i]    ),
                 .instr_done_id_o          ( instr_complete_id   [i]    ),
                 .vreg_rd_addr_o           ( vreg_rd_addr               ),
@@ -1168,6 +1232,7 @@ module vproc_core import vproc_pkg::*, obi_pkg::*; #(
         .clk_i                     ( clk_i                      ),
         .async_rst_ni              ( async_rst_n                ),
         .sync_rst_ni               ( sync_rst_n                 ),
+        .result_commit_valid_i     ( result_commit_valid        ),
         .result_empty_valid_i      ( result_empty_valid         ),
         .result_empty_id_i         ( result_empty_id            ),
         .result_lsu_valid_i        ( lsu_trans_complete_valid   ),

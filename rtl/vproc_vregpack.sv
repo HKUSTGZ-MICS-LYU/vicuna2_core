@@ -64,6 +64,7 @@ module vproc_vregpack #(
 
         // Signals that this instruction ID is done
         output logic                                instr_done_valid_o,
+        output logic                                vxsat_set_o,
         output logic   [INSTR_ID_W            -1:0] instr_done_id_o
     );
 
@@ -106,11 +107,23 @@ module vproc_vregpack #(
         logic                                pend_clr;
         logic   [PEND_CLEAR_CNT_W      -1:0] pend_clr_cnt;
         logic                                instr_done;
+        logic                                saturated;
     } vregpack_state_t;
 
     logic            stage_valid_q, stage_valid_d;
     vregpack_state_t stage_state_q, stage_state_d;
     logic            stage_stall;
+    logic            saturated_q;
+    logic [RES_CNT-1:0] chunk_saturated;
+    // The unit mux emits instruction-contiguous chunks; no ID mirror is needed.
+    always_ff @(posedge clk_i or negedge async_rst_ni) begin
+        if (~async_rst_ni) saturated_q <= 1'b0;
+        else if (~sync_rst_ni) saturated_q <= 1'b0;
+        else if (stage_valid_q & stage_ready) begin
+            if (stage_state_q.instr_done | instr_killed) saturated_q <= 1'b0;
+            else saturated_q <= saturated_q | stage_state_q.saturated;
+        end
+    end
     logic            stage_ready;
     always_ff @(posedge clk_i or negedge async_rst_ni) begin
         if (~async_rst_ni) begin
@@ -144,6 +157,7 @@ module vproc_vregpack #(
             stage_state_d.pend_clr     = pipe_in_pend_clr_i;
             stage_state_d.pend_clr_cnt = pipe_in_pend_clr_cnt_i;
             stage_state_d.instr_done   = pipe_in_instr_done_i;
+            stage_state_d.saturated    = |chunk_saturated;
             for (int i = 0; i < RES_CNT; i++) begin
                 if (pipe_in_res_valid_i[i]) begin
                     stage_state_d.res_buffer[i] = res_buffer_next[i];
@@ -171,9 +185,11 @@ module vproc_vregpack #(
         endcase
     end
 
-    assign stage_stall = (stage_state_q.res_store != '0) & (
+    assign stage_stall = ((stage_state_q.res_store != '0) & (
         pending_vreg_reads_i[stage_state_q.vaddr] | instr_speculative
-    );
+    )) | (stage_state_q.instr_done & (saturated_q | stage_state_q.saturated) & instr_speculative);
+    // A final saturated no-store chunk must await commit/kill too. Other
+    // no-store instructions retain the original early-completion behavior.
     assign stage_ready = ~stage_valid_q | (
         ((stage_state_q.res_store == '0) | vreg_wr_ready_i) & ~stage_stall
     );
@@ -182,6 +198,8 @@ module vproc_vregpack #(
 
     assign instr_done_valid_o = stage_valid_q & stage_state_q.instr_done & stage_ready;
     assign instr_done_id_o    = stage_state_q.instr_id;
+    assign vxsat_set_o = instr_done_valid_o & (saturated_q | stage_state_q.saturated) &
+                         (instr_state_i[stage_state_q.instr_id] == INSTR_COMMITTED);
 
     always_comb begin
         vreg_wr_valid_o = '0;
@@ -207,6 +225,8 @@ module vproc_vregpack #(
     logic [RES_CNT-1:0] res_saturated;
     generate
         for (genvar i = 0; i < RES_CNT; i++) begin
+            assign chunk_saturated[i] = pipe_in_valid_i & pipe_in_res_valid_i[i] &
+                (pipe_in_res_flags_i[i].saturated | res_saturated[i]);
             if (RES_MASK[i]) begin
                 
                 //TODO: ADD NEW VICUNA UPGRADE FOR MASKED RESULTS.  CURRENT IS NOT COMPATIBLE WITH NEW CONTROL FLOW
@@ -392,7 +412,7 @@ module vproc_vregpack #(
                                 // saturate value
                                 if (pipe_in_res_flags_i[i].saturate & (pipe_in_res_data_i[i][j*16+8  +: 8 ] != {8 {pipe_in_res_flags_i[i].sig & pipe_in_res_data_i[i][j*16+7 ]}})) begin
                                     res_default[RES_W[i]/2+j*8  +: 8 ] = pipe_in_res_flags_i[i].sig ? {pipe_in_res_data_i[i][j*16+15], {7 {~pipe_in_res_data_i[i][j*16+15]}}} : '1;
-                                    res_saturated[i]                   = 1'b1;
+                                    res_saturated[i]                  |= pipe_in_res_mask_i[i][j*2];
                                 end
                             end
                             VSEW_32: for (int j = 0; j < RES_W[i] / 32; j++) begin
@@ -401,7 +421,7 @@ module vproc_vregpack #(
                                 // saturate value
                                 if (pipe_in_res_flags_i[i].saturate & (pipe_in_res_data_i[i][j*32+16 +: 16] != {16{pipe_in_res_flags_i[i].sig & pipe_in_res_data_i[i][j*32+15]}})) begin
                                     res_default[RES_W[i]/2+j*16 +: 16] = pipe_in_res_flags_i[i].sig ? {pipe_in_res_data_i[i][j*32+31], {15{~pipe_in_res_data_i[i][j*32+31]}}} : '1;
-                                    res_saturated[i]                   = 1'b1;
+                                    res_saturated[i]                  |= pipe_in_res_mask_i[i][j*4];
                                 end
                             end
                             default: ;
@@ -433,8 +453,19 @@ module vproc_vregpack #(
                         //Copy entire buffer
                         res_buffer_next[i] = res_buffer[i][VPORT_W-1:0];
                         msk_buffer_next[i] = msk_buffer[i][VPORT_W/8-1:0];
-                        //Shift signal used to signal the end of one full result, meaning res_default is complete.  Uses VREG_IDX to determine placement in buffer
-                        if ((~RES_MASK[i] & ~RES_NARROW[i] & ~RES_ALLOW_ELEMWISE[i] & ~RES_ALWAYS_ELEMWISE[i]) |
+                        // Every narrowing chunk contributes RES_W/2 bits. Use the
+                        // existing source-register parity and chunk index directly.
+                        if (RES_NARROW[i] & pipe_in_res_flags_i[i].narrow) begin
+                            if ((pipe_in_res_flags_i[i].vreg_idx == 0) &
+                                (~pipe_in_res_flags_i[i].mul_idx[0] | pipe_in_res_flags_i[i].narrow_frac)) begin
+                                res_buffer_next[i] = '0;
+                                msk_buffer_next[i] = '0;
+                            end
+                            res_buffer_next[i][((int'(pipe_in_res_flags_i[i].mul_idx[0] | pipe_in_res_flags_i[i].narrow_frac) * VPORT_W/2) +
+                                int'(pipe_in_res_flags_i[i].vreg_idx) * RES_W[i]/2) +: RES_W[i]/2] = res_default[RES_W[i]/2 +: RES_W[i]/2];
+                            msk_buffer_next[i][((int'(pipe_in_res_flags_i[i].mul_idx[0] | pipe_in_res_flags_i[i].narrow_frac) * VPORT_W/16) +
+                                int'(pipe_in_res_flags_i[i].vreg_idx) * RES_W[i]/16) +: RES_W[i]/16] = msk_default[RES_W[i]/16 +: RES_W[i]/16];
+                        end else if ((~RES_MASK[i] & ~RES_NARROW[i] & ~RES_ALLOW_ELEMWISE[i] & ~RES_ALWAYS_ELEMWISE[i]) |
                             pipe_in_res_flags_i[i].shift
                         ) begin
                             //clear buffer if this is the first result being written //TODO: This might cause issues when tail elements cannot be overwritten if the mask is not considered

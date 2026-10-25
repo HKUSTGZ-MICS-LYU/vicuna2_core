@@ -27,6 +27,7 @@ module vproc_alu #(
         output CTRL_T                 pipe_out_ctrl_o,
         output logic [ALU_OP_W  -1:0] pipe_out_res_alu_o,
         output logic [ALU_OP_W/8-1:0] pipe_out_res_cmp_o,
+        output logic [ALU_OP_W/8-1:0] pipe_out_saturated_o,
         output logic [ALU_OP_W/8-1:0] pipe_out_mask_o
     );
 
@@ -47,6 +48,8 @@ module vproc_alu #(
     logic [ALU_OP_W    -1:0] result_alu_q,   result_alu_d;
     logic [ALU_OP_W  /8-1:0] result_cmp_q,   result_cmp_d;
     logic [ALU_OP_W  /8-1:0] result_mask_q,  result_mask_d;
+
+    logic [ALU_OP_W/8-1:0] result_saturated_q, result_saturated_d;
 
     // intermediate results:
     logic [ALU_OP_W    -1:0] operand1_tmp_q,     operand1_tmp_d;
@@ -148,6 +151,7 @@ module vproc_alu #(
                     result_alu_q  <= result_alu_d;
                     result_cmp_q  <= result_cmp_d;
                     result_mask_q <= result_mask_d;
+                    result_saturated_q <= result_saturated_d;
                 end
             end
             assign state_res_ready = ~state_res_valid_q | pipe_out_ready_i;
@@ -158,6 +162,7 @@ module vproc_alu #(
                 result_alu_q      = result_alu_d;
                 result_cmp_q      = result_cmp_d;
                 result_mask_q     = result_mask_d;
+                result_saturated_q = result_saturated_d;
             end
             assign state_res_ready = pipe_out_ready_i;
         end
@@ -294,6 +299,10 @@ module vproc_alu #(
     end
     assign pipe_out_res_cmp_o = result_cmp_q;
     assign pipe_out_mask_o    = result_mask_q;
+    assign pipe_out_saturated_o = result_saturated_q;
+    // Reuse exactly the predicate which selects each saturation value.
+    assign result_saturated_d = (~state_ex2_q.mode.alu.cmp &
+                                 (state_ex2_q.mode.alu.opx2.res == ALU_VSADD)) ? cmp_q : '0;
 
 
     ///////////////////////////////////////////////////////////////////////////

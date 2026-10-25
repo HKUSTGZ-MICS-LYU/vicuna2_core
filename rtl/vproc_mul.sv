@@ -29,6 +29,7 @@ module vproc_mul #(
         input  logic                  pipe_out_ready_i,
         output CTRL_T                 pipe_out_ctrl_o,
         output logic [MUL_OP_W  -1:0] pipe_out_res_o,
+        output logic [MUL_OP_W/8-1:0] pipe_out_saturated_o,
         output logic [MUL_OP_W/8-1:0] pipe_out_mask_o
     );
 
@@ -52,6 +53,7 @@ module vproc_mul #(
     logic [MUL_OP_W/8-1:0] result_mask1_q, result_mask1_d;
     logic [MUL_OP_W/8-1:0] result_mask2_q, result_mask2_d;
     logic [MUL_OP_W/8-1:0] result_mask3_q, result_mask3_d;
+    logic [MUL_OP_W/8-1:0] result_saturated_q, result_saturated_d;
 
     generate
         if (BUF_OPERANDS) begin
@@ -107,7 +109,10 @@ module vproc_mul #(
                     result_mask1_q <= result_mask1_d;
                 end
             end
-            assign state_ex2_ready = ~state_ex2_valid_q | state_ex3_ready;
+            // mul_block clocks both multiplier stages on one shared enable.
+            // Control and masks must use that identical enable, even for an
+            // empty stage while a previous output is stalled.
+            assign state_ex2_ready = state_res_ready;
         end else begin
             always_comb begin
                 state_ex2_valid_q = state_ex1_valid_q;
@@ -136,7 +141,7 @@ module vproc_mul #(
                     result_mask2_q <= result_mask2_d;
                 end
             end
-            assign state_ex3_ready = ~state_ex3_valid_q | state_res_ready;
+            assign state_ex3_ready = state_res_ready;
         end else begin
             always_comb begin
                 state_ex3_valid_q = state_ex2_valid_q;
@@ -163,6 +168,7 @@ module vproc_mul #(
                     state_res_q    <= state_ex3_q;
                     result_q       <= result_d;
                     result_mask3_q <= result_mask3_d;
+                    result_saturated_q <= result_saturated_d;
                 end
             end
             assign state_res_ready = ~state_res_valid_q | pipe_out_ready_i;
@@ -172,6 +178,7 @@ module vproc_mul #(
                 state_res_q       = state_ex3_q;
                 result_q          = result_d;
                 result_mask3_q    = result_mask3_d;
+                result_saturated_q = result_saturated_d;
             end
             assign state_res_ready = pipe_out_ready_i;
         end
@@ -201,6 +208,7 @@ module vproc_mul #(
     assign pipe_out_ctrl_o  = state_res_q;
     assign pipe_out_res_o   = result_q;
     assign pipe_out_mask_o  = result_mask3_q;
+    assign pipe_out_saturated_o = result_saturated_q;
 
 
     ///////////////////////////////////////////////////////////////////////////
@@ -267,14 +275,9 @@ module vproc_mul #(
     always_comb begin
         accumulator2_d = DONT_CARE_ZERO ? '0 : 'x;
         unique case (state_ex1_q.mode.mul.op)
-            MUL_VSMUL: begin
-                unique case (state_ex1_q.eew)
-                    VSEW_8:  accumulator2_d = {MUL_OP_W/32{32'h40404040}};
-                    VSEW_16: accumulator2_d = {MUL_OP_W/32{32'h40004000}};
-                    VSEW_32: accumulator2_d = {MUL_OP_W/32{32'h40000000}};
-                    default: ;
-                endcase
-            end
+            // Round the raw product at result composition, using the packet's
+            // VXRM. A fixed multiply-accumulate bias implements only RNU.
+            MUL_VSMUL: accumulator2_d = '0;
             MUL_VMACC: accumulator2_d = accumulator1_q;
             default: ;
         endcase
@@ -373,9 +376,30 @@ module vproc_mul #(
         end
     end
 
+    // Fractional multiplication discards SEW-1 bits. The low result bits
+    // suffice for either sign; signed saturation still uses the original
+    // multiplier sign-bit predicate below, shared by data and event.
+    function automatic logic [31:0] fractional_round(
+        input logic [63:0] product, input int unsigned shift, input cfg_vxrm vxrm
+    );
+        logic half, lower, increment;
+        half = product[shift-1];
+        lower = |(product & ((64'b1 << (shift-1)) - 1));
+        increment = 1'b0;
+        unique case (vxrm)
+            VXRM_RNU: increment = half;
+            VXRM_RNE: increment = half & (lower | product[shift]);
+            VXRM_RDN: increment = 1'b0;
+            VXRM_ROD: increment = ~product[shift] & (half | lower);
+            default: ;
+        endcase
+        return 32'(product >> shift) + {31'b0, increment};
+    endfunction
+
     // compose result
     always_comb begin
         result_d = DONT_CARE_ZERO ? '0 : 'x;
+        result_saturated_d = '0;
         unique case (state_ex3_q.mode.mul.op)
 
             // multiplication retaining low part
@@ -421,16 +445,22 @@ module vproc_mul #(
             MUL_VSMUL: begin
                 unique case (state_ex3_q.eew)
                     VSEW_8: begin
-                        for (int i = 0; i < (MUL_OP_W / 8 ); i++)
-                            result_d[8 *i +: 8 ] = (mul_res[33*i+15] ^ mul_res[33*i+14]) ?  8'h7f       : mul_res[33*i+7  +: 8 ];
+                        for (int i = 0; i < (MUL_OP_W / 8 ); i++) begin
+                            result_saturated_d[1*i +: 1] = {1{mul_res[33*i+15] ^ mul_res[33*i+14]}};
+                            result_d[8 *i +: 8 ] = result_saturated_d[1*i] ?  8'h7f       : 8'(fractional_round({48'b0, mul_res[33*i +: 16]}, 7, state_ex3_q.vxrm));
+                        end
                     end
                     VSEW_16: begin
-                        for (int i = 0; i < (MUL_OP_W / 16); i++)
-                            result_d[16*i +: 16] = (mul_res[66*i+31] ^ mul_res[66*i+30]) ? 16'h7fff     : mul_res[66*i+15 +: 16];
+                        for (int i = 0; i < (MUL_OP_W / 16); i++) begin
+                            result_saturated_d[2*i +: 2] = {2{mul_res[66*i+31] ^ mul_res[66*i+30]}};
+                            result_d[16*i +: 16] = result_saturated_d[2*i] ? 16'h7fff     : 16'(fractional_round({32'b0, mul_res[66*i +: 32]}, 15, state_ex3_q.vxrm));
+                        end
                     end
                     VSEW_32: begin
-                        for (int i = 0; i < (MUL_OP_W / 32); i++)
-                            result_d[32*i +: 32] = (res32  [64*i+63] ^ res32  [64*i+62]) ? 32'h7fffffff : res32  [64*i+31 +: 32];
+                        for (int i = 0; i < (MUL_OP_W / 32); i++) begin
+                            result_saturated_d[4*i +: 4] = {4{res32  [64*i+63] ^ res32  [64*i+62]}};
+                            result_d[32*i +: 32] = result_saturated_d[4*i] ? 32'h7fffffff : fractional_round(res32[64*i +: 64], 31, state_ex3_q.vxrm);
+                        end
                     end
                     default: ;
                 endcase
